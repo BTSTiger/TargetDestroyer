@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Target Zone</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+  #canvas { display: block; width: 100vw; height: 100vh; }
+  #ui { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+  #crosshair { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 20px; height: 20px; }
+  #crosshair::before, #crosshair::after { content: ''; position: absolute; background: rgba(255,255,255,0.85); }
+  #crosshair::before { width: 2px; height: 100%; left: 50%; transform: translateX(-50%); }
+  #crosshair::after  { width: 100%; height: 2px; top: 50%; transform: translateY(-50%); }
+  #hud { position: absolute; top: 20px; left: 50%; transform: translateX(-50%); display: flex; gap: 36px; }
+  .hud-box { background: rgba(0,0,0,0.65); border: 1px solid rgba(255,255,255,0.2); padding: 8px 18px; border-radius: 4px; text-align: center; }
+  .hud-label { font-size: 10px; color: rgba(255,255,255,0.45); letter-spacing: 2px; text-transform: uppercase; }
+  .hud-value { font-size: 22px; color: #fff; font-weight: bold; }
+  #timer-val { color: #ff9900; }
+  #kills-val { color: #00ff88; }
+  #room-val  { color: #88aaff; }
+  #interact-hint { position: absolute; top: 58%; left: 50%; transform: translateX(-50%); font-size: 13px; letter-spacing: 2px; opacity: 0; transition: opacity 0.15s; pointer-events: none; }
+  #fall-msg { position: absolute; top: 28%; left: 50%; transform: translateX(-50%); font-size: 16px; color: #ff4444; letter-spacing: 2px; opacity: 0; transition: opacity 0.4s; }
+  #bottom-bar { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  #room-label { background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.15); padding: 5px 18px; border-radius: 3px; font-size: 11px; color: rgba(255,255,255,0.45); letter-spacing: 2px; }
+  #lock-hint  { font-size: 11px; color: rgba(255,255,255,0.3); letter-spacing: 1px; }
+  #msg { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; color: #fff; pointer-events: all; }
+  #msg h1 { font-size: 40px; letter-spacing: 4px; margin-bottom: 10px; }
+  #msg p { font-size: 15px; color: rgba(255,255,255,0.65); margin-bottom: 24px; line-height: 1.7; }
+  #msg button { background: transparent; border: 1px solid rgba(255,255,255,0.45); color: #fff; padding: 12px 36px; font-size: 13px; letter-spacing: 3px; cursor: pointer; font-family: inherit; text-transform: uppercase; transition: all 0.2s; }
+  #msg button:hover { background: rgba(255,255,255,0.08); border-color: #fff; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="ui">
+  <div id="crosshair"></div>
+  <div id="hud">
+    <div class="hud-box"><div class="hud-label">Time</div><div class="hud-value" id="timer-val">3:00</div></div>
+    <div class="hud-box"><div class="hud-label">Destroyed</div><div class="hud-value" id="kills-val">0 / 18</div></div>
+    <div class="hud-box"><div class="hud-label">Room</div><div class="hud-value" id="room-val">—</div></div>
+  </div>
+  <div id="interact-hint"></div>
+  <div id="fall-msg">YOU FELL — RESPAWNING</div>
+  <div id="bottom-bar">
+    <div id="room-label">WASD · Move &nbsp;|&nbsp; Mouse · Look &nbsp;|&nbsp; Click or Ctrl · Interact</div>
+    <div id="lock-hint">Click the game to capture mouse</div>
+  </div>
+</div>
+
+<div id="msg">
+  <h1>TARGET ZONE</h1>
+  <p>Destroy all 18 targets before time runs out.<br>
+     Only <span style="color:#00ff88">GREEN</span> targets can be destroyed.<br>
+     Destroy 2 → side doors open &nbsp;|&nbsp; Destroy 8 → final room opens.</p>
+  <button id="start-btn">START GAME</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+// ═══════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════
+const GAME_TIME     = 180;
+const PLAYER_H      = 1.6;   // eye height above floor
+const PLAYER_R      = 0.32;  // collision half-width (capsule radius)
+const PLAYER_SPEED  = 4.5;
+const BELT_SPEED    = 7.5;
+const INTERACT_DIST = 6.0;
+const TARGET_SZ     = 0.7;
+
+// ═══════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════
+let scene, camera, renderer, clock;
+let yaw = 0, pitch = 0;
+let locked = false;
+let keys = {};
+let gameActive = false;
+let totalKills = 0;
+let timeLeft   = GAME_TIME;
+let timerID    = null;
+
+// Scene objects
+let targets    = [];  // live target meshes
+let solidWalls = [];  // {minX,maxX,minZ,maxZ} — never passable
+let doorWalls  = [];  // {minX,maxX,minZ,maxZ, key, mesh, open}
+let beltRows   = [];  // {minX,maxX,minZ,maxZ, dir}
+let holeRects  = [];  // {minX,maxX,minZ,maxZ}
+
+let velY       = 0;
+let grounded   = true;
+let falling    = false;
+let aimTarget  = null;
+let fallTmr    = null;
+
+const SPAWN = new THREE.Vector3(0, PLAYER_H, 5.5);
+
+// Materials
+let M = {};
+
+// ═══════════════════════════════════════
+// INITIALISE
+// ═══════════════════════════════════════
+function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0c0c11);
+  scene.fog = new THREE.Fog(0x0c0c11, 16, 52);
+
+  camera = new THREE.PerspectiveCamera(80, innerWidth/innerHeight, 0.05, 100);
+  camera.position.copy(SPAWN);
+
+  renderer = new THREE.WebGLRenderer({
+    canvas: document.getElementById('canvas'), antialias: true
+  });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+
+  clock = new THREE.Clock();
+
+  // ── Materials ──────────────────────────
+  M.wall   = new THREE.MeshLambertMaterial({ color: 0x23232d });
+  M.floor  = new THREE.MeshLambertMaterial({ color: 0x18181f });
+  M.ceil   = new THREE.MeshLambertMaterial({ color: 0x1c1c25 });
+  M.door   = new THREE.MeshLambertMaterial({ color: 0x2a4d6e, emissive: 0x0a1a2a });
+  M.hole   = new THREE.MeshLambertMaterial({ color: 0x040406 });
+  M.beltA  = new THREE.MeshLambertMaterial({ color: 0x1a3352 });
+  M.beltB  = new THREE.MeshLambertMaterial({ color: 0x16402e });
+  M.markA  = new THREE.MeshLambertMaterial({ color: 0x3388cc, emissive: 0x0a2244 });
+  M.markB  = new THREE.MeshLambertMaterial({ color: 0x33aa66, emissive: 0x0a3322 });
+
+  // ── Lighting ────────────────────────────
+  scene.add(new THREE.AmbientLight(0xffffff, 0.28));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.55);
+  sun.position.set(5, 12, 5);
+  sun.castShadow = true;
+  scene.add(sun);
+
+  buildWorld();
+  setupInput();
+  document.getElementById('start-btn').addEventListener('click', startGame);
+  window.addEventListener('resize', onResize);
+
+  animate();
+}
+
+// ═══════════════════════════════════════
+// GEOMETRY HELPERS
+// ═══════════════════════════════════════
+function makeMesh(w, h, d, mat, x, y, z) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  mesh.position.set(x, y, z);
+  scene.add(mesh);
+  return mesh;
+}
+
+// Solid wall — blocks player always
+function addSolidWall(w, h, d, mat, x, y, z) {
+  const mesh = makeMesh(w, h, d, mat, x, y, z);
+  solidWalls.push({ minX: x-w/2, maxX: x+w/2, minZ: z-d/2, maxZ: z+d/2 });
+  return mesh;
+}
+
+// Door — blocks player until opened
+function makeDoorLabel(text, facingZ, mirror) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0)';
+  ctx.fillRect(0, 0, 512, 128);
+  if (mirror) { ctx.save(); ctx.scale(-1, 1); ctx.translate(-512, 0); }
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 36px Courier New';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 256, 64);
+  if (mirror) ctx.restore();
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+  const geom = new THREE.PlaneGeometry(2.2, 0.55);
+  const sprite = new THREE.Mesh(geom, mat);
+  if (facingZ) {
+    sprite.position.set(0, 0, 0.15);
+  } else {
+    sprite.rotation.y = Math.PI / 2;
+    sprite.position.set(-0.15, 0, 0);
+  }
+  return { sprite, canvas, ctx, tex, mirror };
+}
+
+function addDoor(w, h, d, mat, x, y, z, key, threshold) {
+  const mesh = makeMesh(w, h, d, mat, x, y, z);
+  const facingZ = (d < w); // thin in Z = faces Z axis
+  const label = makeDoorLabel(`Destroy ${threshold} to proceed`, facingZ, !facingZ);
+  label.sprite.position.x += x;
+  label.sprite.position.y += 1.5;
+  label.sprite.position.z += z;
+  scene.add(label.sprite);
+  const entry = { key, mesh, open: false, minX: x-w/2, maxX: x+w/2, minZ: z-d/2, maxZ: z+d/2, label, threshold };
+  doorWalls.push(entry);
+  return mesh;
+}
+
+function updateDoorLabels() {
+  for (const d of doorWalls) {
+    if (d.open) { scene.remove(d.label.sprite); continue; }
+    const remaining = Math.max(0, d.threshold - totalKills);
+    const text = remaining > 0 ? `Destroy ${remaining} to proceed` : 'Opening...';
+    const ctx = d.label.ctx;
+    ctx.clearRect(0, 0, 512, 128);
+    if (d.label.mirror) { ctx.save(); ctx.scale(-1, 1); ctx.translate(-512, 0); }
+    ctx.fillStyle = remaining > 0 ? '#ffffff' : '#00ff88';
+    ctx.font = 'bold 36px Courier New';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 256, 64);
+    if (d.label.mirror) ctx.restore();
+    d.label.tex.needsUpdate = true;
+  }
+}
+
+function addFloor(w, d, mat, x, z) {
+  const m = makeMesh(w, 0.2, d, mat, x, -0.1, z);
+  m.receiveShadow = true;
+  return m;
+}
+
+function ptLight(x, y, z, col, int=1.0, dist=18) {
+  const l = new THREE.PointLight(col, int, dist);
+  l.position.set(x, y, z);
+  scene.add(l);
+}
+
+// ═══════════════════════════════════════
+// WORLD CONSTRUCTION
+// ═══════════════════════════════════════
+/*
+  Layout (top-down, Z increases southward):
+
+    FinalRoom   x:-10..+10  z:-39..-21
+        |  (door gap x:-1.2..+1.2 at z=-21)
+    HoleRoom    x: -7..+7   z:-21.. -7
+        |  (door gap x:-1.2..+1.2 at z=-7)
+    StartRoom   x: -7..+7   z: -7..+7
+        →  (door gap z:-1.2..+1.2 at x=+7)
+    BeltRoom    x: +7..+21  z: -3..+13
+
+  KEY RULE: shared walls are built ONCE by one room only.
+  The connecting wall at z=-7 is owned by StartRoom (north wall).
+  HoleRoom's south boundary is open — no wall placed there.
+  Same logic for HoleRoom north / FinalRoom south, and StartRoom east / BeltRoom west.
+*/
+function buildWorld() {
+  buildStartRoom();
+  buildHoleRoom();
+  buildBeltRoom();
+  buildFinalRm();
+}
+
+// Helper: wall segment with explicit world-space extents (no derived maths)
+function wallSeg(x1, x2, z1, z2, h, mat) {
+  const cx = (x1+x2)/2, cz = (z1+z2)/2;
+  const w = x2-x1, d = z2-z1;
+  const mesh = makeMesh(Math.max(w,0.2), h, Math.max(d,0.2), mat, cx, h/2, cz);
+  solidWalls.push({ minX: x1, maxX: x2, minZ: z1, maxZ: z2 });
+  return mesh;
+}
+
+function buildStartRoom() {
+  // Bounds: x -7..+7, z -7..+7
+  addFloor(14, 14, M.floor, 0, 0);
+  makeMesh(14, 0.2, 14, M.ceil, 0, 4, 0);
+
+  // South wall (z=+7): full width, no gap
+  wallSeg(-7, +7, 6.9, 7.1, 4, M.wall);
+  // West wall (x=-7): full depth, no gap
+  wallSeg(-7.1, -6.9, -7, +7, 4, M.wall);
+
+  // North wall (z=-7): gap x=-1.2..+1.2 for 'left' door into HoleRoom
+  wallSeg(-7, -1.2, -7.1, -6.9, 4, M.wall); // west chunk
+  wallSeg(+1.2, +7,  -7.1, -6.9, 4, M.wall); // east chunk
+  addDoor(2.4, 3.0, 0.22, M.door, 0, 1.5, -7, 'left', 2);
+
+  // East wall (x=+7): gap z=-1.2..+1.2 for 'right' door into BeltRoom
+  wallSeg(6.9, 7.1, -7, -1.2, 4, M.wall);  // north chunk
+  wallSeg(6.9, 7.1, +1.2, +7, 4, M.wall);  // south chunk
+  addDoor(0.22, 3.0, 2.4, M.door, 7, 1.5, 0, 'right', 2);
+
+  ptLight(0, 3.5, 0, 0xffeedd, 1.3);
+  spawnTarget(-3,1.5,-2,'r1'); spawnTarget(3,1.5,-2,'r1');
+  spawnTarget(-3,1.5, 3,'r1'); spawnTarget(3,1.5, 3,'r1');
+}
+
+function buildHoleRoom() {
+  // Bounds: x -7..+7, z -21..-7
+  // South wall at z=-7 is shared with StartRoom — DO NOT add it here
+  makeMesh(14, 0.2, 14, M.ceil, 0, 4, -14);
+
+  // West wall (x=-7): full depth
+  wallSeg(-7.1, -6.9, -21, -7, 4, M.wall);
+  // East wall (x=+7): full depth
+  wallSeg(6.9, 7.1, -21, -7, 4, M.wall);
+
+  // North wall (z=-21): spans full FinalRoom width (x -10..+10) with door gap at x=-1.2..+1.2
+  wallSeg(-10, -1.2, -21.1, -20.9, 4, M.wall); // west chunk
+  wallSeg(+1.2, +10, -21.1, -20.9, 4, M.wall);  // east chunk
+  addDoor(2.4, 3.0, 0.22, M.door, 0, 1.5, -21, 'final', 8);
+
+  ptLight(0, 3.5, -14, 0xccddff, 1.0);
+
+  // Tile grid: 7 cols x 7 rows, 2 units apart
+  // col 0..6 → x: -6,-4,-2,0,2,4,6
+  // row 0..6 → z: -8,-10,-12,-14,-16,-18,-20
+  // Holes defined as [col, row] indices into this grid
+  const holeIndices = [
+    [1,1],[4,1],   // row z=-10: x=-4, x=2
+    [2,2],[5,2],   // row z=-12: x=-2, x=4
+    [1,3],[3,3],   // row z=-14: x=-4, x=0
+    [0,4],[4,4],   // row z=-16: x=-6, x=2
+    [2,5],[5,5],   // row z=-18: x=-2, x=4
+  ];
+
+  const holeSet = new Set(holeIndices.map(([c,r])=>c+','+r));
+
+  for (let col = 0; col < 7; col++) {
+    for (let row = 0; row < 7; row++) {
+      const tx = -6 + col * 2;
+      const tz = -8 - row * 2;
+      if (holeSet.has(col+','+row)) {
+        // Register fall rect exactly matching the gap
+        holeRects.push({ minX:tx-0.9, maxX:tx+0.9, minZ:tz-0.9, maxZ:tz+0.9 });
+      } else {
+        makeMesh(1.85, 0.2, 1.85, M.floor, tx, -0.1, tz);
+      }
+    }
+  }
+
+  spawnTarget(-5,1.5,-10,'r2L'); spawnTarget(5,1.5,-10,'r2L');
+  spawnTarget(-5,1.5,-18,'r2L'); spawnTarget(5,1.5,-18,'r2L');
+}
+
+function buildBeltRoom() {
+  // Bounds: x +7..+21, z -3..+13
+  addFloor(14, 16, M.floor, 14, 5);
+  makeMesh(14, 0.2, 16, M.ceil, 14, 4, 5);
+
+  // North wall (z=-3): full width
+  wallSeg(7, 21, -3.1, -2.9, 4, M.wall);
+  // East wall (x=+21): full depth
+  wallSeg(20.9, 21.1, -3, 13, 4, M.wall);
+  // South wall (z=+13): full width
+  wallSeg(7, 21, 12.9, 13.1, 4, M.wall);
+  // West wall (x=+7): two chunks either side of door gap (z=-1.2..+1.2)
+  wallSeg(6.9, 7.1, -3, -1.2, 4, M.wall);
+  wallSeg(6.9, 7.1, 1.2, 13,  4, M.wall);
+
+  ptLight(14, 3.5, 5, 0xffddbb, 1.0);
+
+  // 8 belt rows
+  const dirs = [-1,1,-1,1,1,-1,1,-1];
+  for (let i = 0; i < 8; i++) {
+    const bz = -2 + i * 1.9;
+    const bm = makeMesh(13.6, 0.22, 1.7, i%2 ? M.beltB : M.beltA, 14, 0, bz);
+    bm.receiveShadow = true;
+    beltRows.push({ minX:7.2, maxX:20.8, minZ:bz-0.85, maxZ:bz+0.85, dir:dirs[i] });
+    for (let a = 0; a < 4; a++)
+      makeMesh(0.25, 0.26, 0.4, dirs[i]>0 ? M.markA : M.markB, 8+a*3, 0.12, bz);
+  }
+
+  spawnTarget(10,1.5,-1,'r2R'); spawnTarget(14,1.5,-1,'r2R');
+  spawnTarget(18,1.5,-1,'r2R'); spawnTarget(14,1.5,10,'r2R');
+}
+
+function buildFinalRm() {
+  // Bounds: x -10..+10, z -39..-21
+  makeMesh(20, 0.2, 18, M.ceil, 0, 4, -30);
+
+  // North wall (z=-39): full width
+  wallSeg(-10, 10, -39.1, -38.9, 4, M.wall);
+  // West wall (x=-10): full depth
+  wallSeg(-10.1, -9.9, -39, -21, 4, M.wall);
+  // East wall (x=+10): full depth
+  wallSeg(9.9, 10.1, -39, -21, 4, M.wall);
+
+  ptLight(-5, 3.5, -30, 0xff5533, 1.1);
+  ptLight( 5, 3.5, -30, 0x3355ff, 1.1);
+
+  // 8 belt rows filling the room depth, alternating direction
+  // Room: x -10..+10 (width 20), z -39..-21 (depth 18)
+  // 8 rows × 2.0 deep, starting at z=-22 going north
+  const fDirs = [-1,1,-1,1,1,-1,1,-1];
+  const fBeltMats = [M.beltA, M.beltB];
+
+  // Tile columns for hole placement: 10 cols of width 2, centres at -9,-7,-5,-3,-1,1,3,5,7,9
+  const colCentres = [-9,-7,-5,-3,-1,1,3,5,7,9];
+
+  // For each belt row, pick 2 random hole columns (fixed seed-like spread for playability)
+  // Use predetermined hole pairs so layout is consistent each game
+  const holeColumns = [
+    [1],[3],[0],[2],[4],[1],[3],[0]
+  ];
+
+  for (let i = 0; i < 8; i++) {
+    const bz = -22.5 - i * 2.1;
+    const holeCols = holeColumns[i];
+
+    // Place belt tiles (10 columns of width 2, skip hole columns)
+    for (let c = 0; c < 10; c++) {
+      const tx = colCentres[c];
+      if (holeCols.includes(c)) {
+        // Register hole rect
+        holeRects.push({ minX:tx-0.9, maxX:tx+0.9, minZ:bz-0.9, maxZ:bz+0.9 });
+      } else {
+        const bm = makeMesh(1.85, 0.22, 1.85, i%2 ? M.beltB : M.beltA, tx, 0, bz);
+        bm.receiveShadow = true;
+      }
+    }
+
+    // Register belt push zone (full row width, player slides on solid tiles)
+    beltRows.push({ minX:-10, maxX:10, minZ:bz-1.0, maxZ:bz+1.0, dir:fDirs[i] });
+
+    // Direction markers on solid tiles
+    for (let c = 0; c < 10; c++) {
+      if (!holeCols.includes(c)) {
+        makeMesh(0.25, 0.26, 0.4, fDirs[i]>0 ? M.markA : M.markB, colCentres[c], 0.12, bz);
+      }
+    }
+  }
+
+  // Place 10 targets — one per belt row (first two rows get 2 each),
+  // always on a solid tile (not a hole column)
+  const targetLayout = [
+    [0,0],[4,1],[2,2],[7,3],[5,4],
+    [3,5],[8,6],[1,7],[6,2],[9,4]
+  ]; // [colIndex, rowIndex]
+  targetLayout.forEach(([c,r]) => {
+    const tx = colCentres[c];
+    const tz = -22.5 - r * 2.1;
+    spawnTarget(tx, 1.5, tz, 'final');
+  });
+}
+
+
+// ═══════════════════════════════════════
+// TARGETS
+// ═══════════════════════════════════════
+function spawnTarget(x,y,z,room) {
+  const mesh=new THREE.Mesh(
+    new THREE.BoxGeometry(TARGET_SZ,TARGET_SZ,TARGET_SZ),
+    new THREE.MeshLambertMaterial({color:0xff2222,emissive:0x440000})
+  );
+  mesh.position.set(x,y,z);
+  mesh.castShadow=true;
+  mesh.userData={isGreen:false,room,nextToggle:clock.getElapsedTime()+0.3+Math.random()*2,interval:1.5+Math.random()*2};
+  scene.add(mesh);
+  targets.push(mesh);
+}
+
+function updateTargets() {
+  const now=clock.getElapsedTime();
+  for(const t of targets){
+    if(now>=t.userData.nextToggle){
+      t.userData.isGreen=!t.userData.isGreen;
+      t.material.color.setHex(t.userData.isGreen?0x00ff66:0xff2222);
+      t.material.emissive.setHex(t.userData.isGreen?0x003311:0x440000);
+      t.userData.interval=Math.max(0.65,t.userData.interval-0.015);
+      t.userData.nextToggle=now+t.userData.interval*(0.55+Math.random()*0.9);
+    }
+    const s=t.userData.isGreen?1+0.045*Math.sin(now*7):1;
+    t.scale.setScalar(s);
+  }
+}
+
+function killTarget(t) {
+  scene.remove(t);
+  targets.splice(targets.indexOf(t),1);
+  totalKills++;
+  document.getElementById('kills-val').textContent=`${totalKills} / 18`;
+  checkDoors();
+  if(totalKills>=18) endGame(true);
+}
+
+// ═══════════════════════════════════════
+// COLLISION
+// ═══════════════════════════════════════
+// Resolve a 2-D point (px,pz) with PLAYER_R radius against all walls.
+// Returns the pushed-out position.
+function resolveCollision(px,pz) {
+  let x=px,z=pz;
+  // Process solid walls
+  for(const w of solidWalls) {
+    const ox=overlapAmount(x,PLAYER_R,w.minX,w.maxX);
+    const oz=overlapAmount(z,PLAYER_R,w.minZ,w.maxZ);
+    if(ox>0&&oz>0) {
+      // push along axis of least overlap
+      if(ox<=oz) x+=pushDir(x,w.minX,w.maxX)*ox;
+      else        z+=pushDir(z,w.minZ,w.maxZ)*oz;
+    }
+  }
+
+  // Process doors — block player only while closed
+  for(const w of doorWalls) {
+    if(w.open) continue;
+    const ox=overlapAmount(x,PLAYER_R,w.minX,w.maxX);
+    const oz=overlapAmount(z,PLAYER_R,w.minZ,w.maxZ);
+    if(ox>0&&oz>0) {
+      if(ox<=oz) x+=pushDir(x,w.minX,w.maxX)*ox;
+      else        z+=pushDir(z,w.minZ,w.maxZ)*oz;
+    }
+  }
+  return{x,z};
+}
+
+function overlapAmount(p,r,min,max) {
+  // How much does the circle [p-r, p+r] overlap [min, max]?
+  const lo=p-r, hi=p+r;
+  if(hi<=min||lo>=max) return 0;
+  return Math.min(hi-min, max-lo);
+}
+
+function pushDir(p,min,max) {
+  // Which direction to push p out of [min,max]?
+  return (p<(min+max)/2) ? -1 : 1;
+}
+
+// ═══════════════════════════════════════
+// DOORS
+// ═══════════════════════════════════════
+function checkDoors() {
+  if(totalKills>=2) {openKey('left');openKey('right');}
+  if(totalKills>=8) openKey('final');
+}
+
+function openKey(key) {
+  const d=doorWalls.find(d=>d.key===key);
+  if(!d||d.open) return;
+  d.open=true;
+  animDoor(d);
+}
+
+function animDoor(door) {
+  const mesh=door.mesh, label=door.label&&door.label.sprite;
+  const y0=mesh.position.y, y1=y0+4.5;
+  const ly0=label?label.position.y:0;
+  let p=0;
+  (function step(){
+    p=Math.min(p+0.03,1);
+    mesh.position.y=y0+(y1-y0)*p;
+    if(label) label.position.y=ly0+(y1-y0)*p;
+    if(p<1) requestAnimationFrame(step);
+  })();
+}
+
+// ═══════════════════════════════════════
+// PLAYER
+// ═══════════════════════════════════════
+function updatePlayer(dt) {
+  const fwd=new THREE.Vector3();
+  camera.getWorldDirection(fwd); fwd.y=0; fwd.normalize();
+  const right=new THREE.Vector3().crossVectors(fwd,new THREE.Vector3(0,1,0)).normalize();
+
+  let dx=0,dz=0;
+  if(keys['KeyW']||keys['ArrowUp'])    {dx+=fwd.x;  dz+=fwd.z;}
+  if(keys['KeyS']||keys['ArrowDown'])  {dx-=fwd.x;  dz-=fwd.z;}
+  if(keys['KeyA']||keys['ArrowLeft'])  {dx-=right.x;dz-=right.z;}
+  if(keys['KeyD']||keys['ArrowRight']) {dx+=right.x;dz+=right.z;}
+
+  const len=Math.sqrt(dx*dx+dz*dz);
+  if(len>0){dx=dx/len*PLAYER_SPEED*dt;dz=dz/len*PLAYER_SPEED*dt;}
+
+  // Belt push (before collision)
+  for(const b of beltRows){
+    if(camera.position.x>b.minX&&camera.position.x<b.maxX&&
+       camera.position.z>b.minZ&&camera.position.z<b.maxZ){
+      dx+=b.dir*BELT_SPEED*dt;
+    }
+  }
+
+  // Apply movement then resolve walls
+  let nx=camera.position.x+dx;
+  let nz=camera.position.z+dz;
+  const r=resolveCollision(nx,nz);
+  camera.position.x=r.x;
+  camera.position.z=r.z;
+
+  // Check holes — is the player's XZ over a hole?
+  let overHole=false;
+  for(const h of holeRects){
+    if(camera.position.x>h.minX&&camera.position.x<h.maxX&&
+       camera.position.z>h.minZ&&camera.position.z<h.maxZ){
+      overHole=true; break;
+    }
+  }
+
+  // Step onto a hole: start falling, lock in
+  if(overHole && grounded){ grounded=false; falling=true; velY=0; }
+
+  // Gravity always acts when not grounded
+  if(!grounded){ velY-=20*dt; camera.position.y+=velY*dt; }
+
+  // Only snap to floor when grounded AND on solid floor (not falling through hole)
+  if(grounded && !falling && camera.position.y<=PLAYER_H){
+    camera.position.y=PLAYER_H; velY=0;
+  }
+
+  // Respawn when fallen far enough
+  if(camera.position.y<-8) respawn();
+
+  // Room label
+  const p=camera.position;
+  let room='START';
+  if(p.z<-7&&p.x>7)               room='CONVEYOR';
+  else if(p.z<-7&&p.z>-21)        room='MAZE';
+  else if(p.z<-21)                 room='FINAL';
+  document.getElementById('room-val').textContent=room;
+}
+
+function respawn(){
+  camera.position.copy(SPAWN);
+  velY=0;grounded=true;falling=false;
+  // 10-second time penalty
+  timeLeft=Math.max(0, timeLeft-10);
+  const m=Math.floor(timeLeft/60),s=timeLeft%60;
+  document.getElementById('timer-val').textContent=`${m}:${s.toString().padStart(2,'0')}`;
+  if(timeLeft<=30) document.getElementById('timer-val').style.color='#ff4444';
+  if(timeLeft<=0){endGame(false);return;}
+  const el=document.getElementById('fall-msg');
+  el.textContent='YOU FELL  –10s';
+  el.style.opacity='1';
+  clearTimeout(fallTmr);
+  fallTmr=setTimeout(()=>el.style.opacity='0',2200);
+}
+
+// ═══════════════════════════════════════
+// RAYCAST / AIM
+// ═══════════════════════════════════════
+const ray=new THREE.Raycaster();
+function updateAim(){
+  ray.setFromCamera({x:0,y:0},camera);
+  const hits=ray.intersectObjects(targets);
+  const hint=document.getElementById('interact-hint');
+  if(hits.length>0&&hits[0].distance<INTERACT_DIST){
+    aimTarget=hits[0].object;
+    hint.style.opacity='1';
+    if(aimTarget.userData.isGreen){
+      hint.style.color='#00ff88';
+      hint.textContent='[ CLICK / CTRL ]  DESTROY';
+    }else{
+      hint.style.color='#ff5544';
+      hint.textContent='WAIT FOR GREEN';
+    }
+  }else{
+    aimTarget=null;
+    hint.style.opacity='0';
+  }
+}
+
+function tryInteract(){
+  if(!gameActive||!aimTarget||!aimTarget.userData.isGreen) return;
+  killTarget(aimTarget);
+  aimTarget=null;
+}
+
+// ═══════════════════════════════════════
+// INPUT + POINTER LOCK
+// ═══════════════════════════════════════
+function setupInput(){
+  const canvas=document.getElementById('canvas');
+
+  canvas.addEventListener('click',()=>{
+    if(gameActive&&!locked) canvas.requestPointerLock();
+  });
+
+  document.addEventListener('pointerlockchange',()=>{
+    locked=document.pointerLockElement===canvas;
+    document.getElementById('lock-hint').textContent=
+      locked?'Press Esc to release mouse':'Click the game to capture mouse';
+  });
+
+  document.addEventListener('mousemove',e=>{
+    if(!locked) return;
+    yaw  -=e.movementX*0.002;
+    pitch-=e.movementY*0.002;
+    pitch=Math.max(-Math.PI/2.1,Math.min(Math.PI/2.1,pitch));
+    camera.quaternion
+      .copy(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0),yaw))
+      .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),pitch));
+  });
+
+  // Only interact when already locked (first click just acquires lock)
+  document.addEventListener('mousedown',e=>{
+    if(e.button===0&&locked&&gameActive) tryInteract();
+  });
+
+  document.addEventListener('keydown',e=>{
+    keys[e.code]=true;
+    if((e.code==='ControlLeft'||e.code==='ControlRight')&&gameActive) tryInteract();
+  });
+  document.addEventListener('keyup',e=>{keys[e.code]=false;});
+}
+
+// ═══════════════════════════════════════
+// TIMER / GAME FLOW
+// ═══════════════════════════════════════
+function startTimer(){
+  clearInterval(timerID);
+  timerID=setInterval(()=>{
+    if(!gameActive) return;
+    timeLeft--;
+    const m=Math.floor(timeLeft/60),s=timeLeft%60;
+    document.getElementById('timer-val').textContent=`${m}:${s.toString().padStart(2,'0')}`;
+    if(timeLeft<=30) document.getElementById('timer-val').style.color='#ff4444';
+    if(timeLeft<=0) endGame(false);
+  },1000);
+}
+
+function startGame(){
+  document.getElementById('msg').style.display='none';
+  totalKills=0; timeLeft=GAME_TIME;
+  document.getElementById('kills-val').textContent='0 / 18';
+  document.getElementById('timer-val').textContent='3:00';
+  document.getElementById('timer-val').style.color='#ff9900';
+
+  targets.forEach(t=>scene.remove(t));
+  targets=[];
+  doorWalls.forEach(d=>{d.open=false;d.mesh.position.y=1.5;d.mesh.material=M.door;if(d.label&&d.label.sprite){d.label.sprite.position.y=1.5;scene.add(d.label.sprite);}});
+
+  spawnTarget(-3,1.5,-2,'r1'); spawnTarget(3,1.5,-2,'r1');
+  spawnTarget(-3,1.5, 3,'r1'); spawnTarget(3,1.5, 3,'r1');
+  // HoleRoom targets
+  spawnTarget(-5,1.5,-10,'r2L'); spawnTarget(5,1.5,-10,'r2L');
+  spawnTarget(-5,1.5,-18,'r2L'); spawnTarget(5,1.5,-18,'r2L');
+  // BeltRoom targets
+  spawnTarget(10,1.5,-1,'r2R'); spawnTarget(14,1.5,-1,'r2R');
+  spawnTarget(18,1.5,-1,'r2R'); spawnTarget(14,1.5,10,'r2R');
+  // Final targets — match buildFinalRm targetLayout
+  const fCols = [-9,-7,-5,-3,-1,1,3,5,7,9];
+  [[0,0],[4,1],[2,2],[6,3],[5,4],[3,5],[8,6],[1,7],[6,2],[2,4]].forEach(([c,r])=>{
+    spawnTarget(fCols[c], 1.5, -22.5 - r*2.1, 'final');
+  });
+
+  camera.position.copy(SPAWN);
+  yaw=0;pitch=0;
+  camera.quaternion.set(0,0,0,1);
+  velY=0;grounded=true;falling=false;
+  gameActive=true;
+
+  document.getElementById('canvas').requestPointerLock();
+  startTimer();
+}
+
+function endGame(won){
+  gameActive=false;
+  clearInterval(timerID);
+  document.exitPointerLock();
+  const elapsed=GAME_TIME-timeLeft;
+  const m=Math.floor(elapsed/60),s=elapsed%60;
+  const msg=document.getElementById('msg');
+  msg.querySelector('h1').textContent=won?'MISSION COMPLETE':'TIME EXPIRED';
+  msg.querySelector('p').innerHTML=won
+    ?`All 18 targets eliminated in ${m}m ${s}s`
+    :`${totalKills} of 18 targets destroyed<br><span style="color:rgba(255,255,255,0.4);font-size:13px">Destroy 2 to open doors · Destroy 8 to reach the final room</span>`;
+  msg.querySelector('button').textContent=won?'PLAY AGAIN':'TRY AGAIN';
+  msg.style.display='block';
+}
+
+document.getElementById('start-btn').addEventListener('click',startGame);
+
+// ═══════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.05);
+  if(gameActive){updatePlayer(dt);updateTargets();updateAim();updateDoorLabels();}
+  renderer.render(scene,camera);
+}
+
+function onResize(){
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+}
+window.addEventListener('resize',onResize);
+
+init();
+</script>
+</body>
+</html>
